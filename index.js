@@ -3,7 +3,7 @@ require('dotenv').config();
 const fs = require('fs');
 const path = require('path');
 const { MongoClient } = require('mongodb');
-const archiver = require('archiver');
+const crypto = require('crypto');
 const { exec } = require('child_process');
 const { promisify } = require('util');
 
@@ -23,8 +23,27 @@ if (!fs.existsSync(BACKUP_DIR)) {
 }
 
 async function createBackup() {
-    const timestamp = new Date().toISOString().replace(/[:.]/g, '-');
-    const backupPath = path.join(BACKUP_DIR, `backup-${timestamp}.json`);
+    const now = new Date();
+
+    // Formato de carpeta: AAAA/MM/DD
+    const year = now.getFullYear();
+    const month = String(now.getMonth() + 1).padStart(2, '0');
+    const day = String(now.getDate()).padStart(2, '0');
+
+    // Formato de archivo: HH_MM_SS_HASH.json
+    const hours = String(now.getHours()).padStart(2, '0');
+    const minutes = String(now.getMinutes()).padStart(2, '0');
+    const seconds = String(now.getSeconds()).padStart(2, '0');
+    const hash = crypto.randomBytes(4).toString('hex'); // 8 caracteres hexadecimales
+
+    const dateFolder = path.join(BACKUP_DIR, year.toString(), month, day);
+    const fileName = `${hours}_${minutes}_${seconds}_${hash}.json`;
+    const backupPath = path.join(dateFolder, fileName);
+
+    // Crear directorio de fecha si no existe
+    if (!fs.existsSync(dateFolder)) {
+        fs.mkdirSync(dateFolder, { recursive: true });
+    }
 
     const client = new MongoClient(MONGO_URI);
 
@@ -37,7 +56,7 @@ async function createBackup() {
 
         const backup = {
             database: DB_NAME,
-            timestamp: new Date().toISOString(),
+            timestamp: now.toISOString(),
             collections: {}
         };
 
@@ -67,48 +86,45 @@ async function createBackup() {
     }
 }
 
-async function compressBackup(backupPath) {
-    const zipPath = `${backupPath.replace('.json', '')}.zip`;
 
-    return new Promise((resolve, reject) => {
-        const output = fs.createWriteStream(zipPath);
-        const archive = archiver('zip', { zlib: { level: 9 } });
-
-        output.on('close', () => {
-            const sizeInMB = (archive.pointer() / (1024 * 1024)).toFixed(2);
-            console.log(`Backup comprimido: ${path.basename(zipPath)} (${sizeInMB} MB)`);
-            fs.unlinkSync(backupPath);
-            resolve(zipPath);
-        });
-
-        archive.on('error', (err) => reject(err));
-
-        archive.pipe(output);
-        archive.file(backupPath, { name: path.basename(backupPath) });
-        archive.finalize();
-    });
-}
 
 function cleanOldBackups(daysToKeep = 30) {
     try {
-        const files = fs.readdirSync(BACKUP_DIR);
         const cutoffDate = new Date();
         cutoffDate.setDate(cutoffDate.getDate() - daysToKeep);
-
         let deletedCount = 0;
 
-        files.forEach(file => {
-            if (file.startsWith('backup-') && file.endsWith('.zip')) {
-                const filePath = path.join(BACKUP_DIR, file);
-                const stats = fs.statSync(filePath);
-                
-                if (stats.mtime < cutoffDate) {
-                    fs.unlinkSync(filePath);
-                    console.log(`Eliminado: ${file}`);
-                    deletedCount++;
+        // Función recursiva para explorar carpetas
+        function scanDirectory(dir) {
+            if (!fs.existsSync(dir)) return;
+
+            const items = fs.readdirSync(dir);
+
+            for (const item of items) {
+                const itemPath = path.join(dir, item);
+                const stats = fs.statSync(itemPath);
+
+                if (stats.isDirectory()) {
+                    // Recursivamente explorar subcarpetas
+                    scanDirectory(itemPath);
+
+                    // Eliminar carpeta si está vacía
+                    if (fs.readdirSync(itemPath).length === 0) {
+                        fs.rmdirSync(itemPath);
+                        console.log(`Carpeta vacía eliminada: ${itemPath}`);
+                    }
+                } else if (stats.isFile() && item.endsWith('.json')) {
+                    // Eliminar archivos JSON antiguos
+                    if (stats.mtime < cutoffDate) {
+                        fs.unlinkSync(itemPath);
+                        console.log(`Eliminado: ${itemPath}`);
+                        deletedCount++;
+                    }
                 }
             }
-        });
+        }
+
+        scanDirectory(BACKUP_DIR);
 
         if (deletedCount === 0) {
             console.log('No hay backups antiguos para eliminar');
@@ -128,14 +144,14 @@ async function syncToDrive() {
 
     try {
         console.log('\nSincronizando con Google Drive...');
-        
+
         const command = `rclone sync "${BACKUP_DIR}" "${RCLONE_REMOTE}" --transfers 4 --checkers 8`;
         const { stdout, stderr } = await execPromise(command);
-        
+
         if (stderr) {
             console.log('Advertencias:', stderr);
         }
-        
+
         console.log('Sincronización completada');
     } catch (error) {
         console.error('Error al sincronizar con Drive:', error.message);
@@ -145,19 +161,34 @@ async function syncToDrive() {
 
 function getBackupStats() {
     try {
-        const files = fs.readdirSync(BACKUP_DIR);
-        const backupFiles = files.filter(f => f.startsWith('backup-') && f.endsWith('.zip'));
-        
         let totalSize = 0;
-        backupFiles.forEach(file => {
-            const stats = fs.statSync(path.join(BACKUP_DIR, file));
-            totalSize += stats.size;
-        });
+        let backupCount = 0;
+
+        // Función recursiva para contar archivos
+        function scanDirectory(dir) {
+            if (!fs.existsSync(dir)) return;
+
+            const items = fs.readdirSync(dir);
+
+            for (const item of items) {
+                const itemPath = path.join(dir, item);
+                const stats = fs.statSync(itemPath);
+
+                if (stats.isDirectory()) {
+                    scanDirectory(itemPath);
+                } else if (stats.isFile() && item.endsWith('.json')) {
+                    totalSize += stats.size;
+                    backupCount++;
+                }
+            }
+        }
+
+        scanDirectory(BACKUP_DIR);
 
         const totalSizeMB = (totalSize / (1024 * 1024)).toFixed(2);
-        
+
         console.log('\nEstadísticas de backups:');
-        console.log(`   Total de backups: ${backupFiles.length}`);
+        console.log(`   Total de backups: ${backupCount}`);
         console.log(`   Espacio utilizado: ${totalSizeMB} MB`);
         console.log(`   Ubicación: ${path.resolve(BACKUP_DIR)}`);
     } catch (error) {
@@ -174,15 +205,14 @@ async function main() {
         console.log(`Sync a Drive: ${ENABLE_SYNC ? 'Habilitado' : 'Deshabilitado'}\n`);
 
         const backupPath = await createBackup();
-        const zipPath = await compressBackup(backupPath);
-        
+
         console.log('\nLimpiando backups antiguos...');
         cleanOldBackups(DAYS_TO_KEEP);
-        
+
         if (ENABLE_SYNC) {
             await syncToDrive();
         }
-        
+
         getBackupStats();
 
         console.log('\nProceso completado exitosamente');
