@@ -2,8 +2,8 @@ require('dotenv').config();
 
 const fs = require('fs');
 const path = require('path');
+const crypto = require('crypto');
 const { MongoClient } = require('mongodb');
-const archiver = require('archiver');
 
 // Configuración desde variables de entorno
 const MONGO_URI = process.env.MONGO_URI
@@ -16,9 +16,28 @@ if (!fs.existsSync(BACKUP_DIR)) {
     fs.mkdirSync(BACKUP_DIR, { recursive: true });
 }
 
+function generateBackupPath() {
+    const now = new Date();
+    const year = now.getFullYear();
+    const month = String(now.getMonth() + 1).padStart(2, '0');
+    const day = String(now.getDate()).padStart(2, '0');
+    const hours = String(now.getHours()).padStart(2, '0');
+    const minutes = String(now.getMinutes()).padStart(2, '0');
+    const seconds = String(now.getSeconds()).padStart(2, '0');
+    const hash = crypto.randomBytes(4).toString('hex');
+
+    const dateDir = path.join(BACKUP_DIR, year.toString(), month, day);
+    
+    if (!fs.existsSync(dateDir)) {
+        fs.mkdirSync(dateDir, { recursive: true });
+    }
+
+    const fileName = `${hours}_${minutes}_${seconds}_${hash}.json`;
+    return path.join(dateDir, fileName);
+}
+
 async function createBackup() {
-    const timestamp = new Date().toISOString().replace(/[:.]/g, '-');
-    const backupPath = path.join(BACKUP_DIR, `backup-${timestamp}.json`);
+    const backupPath = generateBackupPath();
 
     const client = new MongoClient(MONGO_URI);
 
@@ -61,48 +80,42 @@ async function createBackup() {
     }
 }
 
-async function compressBackup(backupPath) {
-    const zipPath = `${backupPath.replace('.json', '')}.zip`;
-
-    return new Promise((resolve, reject) => {
-        const output = fs.createWriteStream(zipPath);
-        const archive = archiver('zip', { zlib: { level: 9 } });
-
-        output.on('close', () => {
-            const sizeInMB = (archive.pointer() / (1024 * 1024)).toFixed(2);
-            console.log(`Backup comprimido: ${path.basename(zipPath)} (${sizeInMB} MB)`);
-            fs.unlinkSync(backupPath);
-            resolve(zipPath);
-        });
-
-        archive.on('error', (err) => reject(err));
-
-        archive.pipe(output);
-        archive.file(backupPath, { name: path.basename(backupPath) });
-        archive.finalize();
-    });
-}
-
 function cleanOldBackups(daysToKeep = 30) {
     try {
-        const files = fs.readdirSync(BACKUP_DIR);
         const cutoffDate = new Date();
         cutoffDate.setDate(cutoffDate.getDate() - daysToKeep);
 
         let deletedCount = 0;
 
-        files.forEach(file => {
-            if (file.startsWith('backup-') && file.endsWith('.zip')) {
-                const filePath = path.join(BACKUP_DIR, file);
-                const stats = fs.statSync(filePath);
-
-                if (stats.mtime < cutoffDate) {
-                    fs.unlinkSync(filePath);
-                    console.log(`Eliminado: ${file}`);
-                    deletedCount++;
+        // Función recursiva para buscar y eliminar archivos antiguos
+        function processDirectory(dir) {
+            if (!fs.existsSync(dir)) return;
+            
+            const entries = fs.readdirSync(dir, { withFileTypes: true });
+            
+            for (const entry of entries) {
+                const fullPath = path.join(dir, entry.name);
+                
+                if (entry.isDirectory()) {
+                    processDirectory(fullPath);
+                    // Eliminar directorio si está vacío
+                    const remaining = fs.readdirSync(fullPath);
+                    if (remaining.length === 0) {
+                        fs.rmdirSync(fullPath);
+                        console.log(`Directorio vacío eliminado: ${fullPath}`);
+                    }
+                } else if (entry.name.endsWith('.json')) {
+                    const stats = fs.statSync(fullPath);
+                    if (stats.mtime < cutoffDate) {
+                        fs.unlinkSync(fullPath);
+                        console.log(`Eliminado: ${fullPath}`);
+                        deletedCount++;
+                    }
                 }
             }
-        });
+        }
+
+        processDirectory(BACKUP_DIR);
 
         if (deletedCount === 0) {
             console.log('No hay backups antiguos para eliminar');
@@ -116,19 +129,33 @@ function cleanOldBackups(daysToKeep = 30) {
 
 function getBackupStats() {
     try {
-        const files = fs.readdirSync(BACKUP_DIR);
-        const backupFiles = files.filter(f => f.startsWith('backup-') && f.endsWith('.zip'));
-
         let totalSize = 0;
-        backupFiles.forEach(file => {
-            const stats = fs.statSync(path.join(BACKUP_DIR, file));
-            totalSize += stats.size;
-        });
+        let fileCount = 0;
+
+        function countFiles(dir) {
+            if (!fs.existsSync(dir)) return;
+            
+            const entries = fs.readdirSync(dir, { withFileTypes: true });
+            
+            for (const entry of entries) {
+                const fullPath = path.join(dir, entry.name);
+                
+                if (entry.isDirectory()) {
+                    countFiles(fullPath);
+                } else if (entry.name.endsWith('.json')) {
+                    const stats = fs.statSync(fullPath);
+                    totalSize += stats.size;
+                    fileCount++;
+                }
+            }
+        }
+
+        countFiles(BACKUP_DIR);
 
         const totalSizeMB = (totalSize / (1024 * 1024)).toFixed(2);
 
         console.log('\nEstadisticas de backups:');
-        console.log(`   Total de backups: ${backupFiles.length}`);
+        console.log(`   Total de backups: ${fileCount}`);
         console.log(`   Espacio utilizado: ${totalSizeMB} MB`);
         console.log(`   Ubicación: ${path.resolve(BACKUP_DIR)}`);
     } catch (error) {
@@ -143,8 +170,7 @@ async function main() {
         console.log(`Directorio: ${BACKUP_DIR}`);
         console.log(`Retencion: ${DAYS_TO_KEEP} dias\n`);
 
-        const backupPath = await createBackup();
-        const zipPath = await compressBackup(backupPath);
+        await createBackup();
 
         console.log('\nLimpiando backups antiguos...');
         cleanOldBackups(DAYS_TO_KEEP);
