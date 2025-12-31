@@ -1,5 +1,5 @@
 require('dotenv').config();
-const { MongoClient } = require('mongodb');
+const { MongoClient, ObjectId } = require('mongodb');
 const fs = require('fs');
 const path = require('path');
 const readline = require('readline');
@@ -33,14 +33,14 @@ function getAllBackups(dir, fileList = []) {
 async function listBackups() {
   const backupDir = process.env.BACKUP_DIR || './backups';
   
-    if (!fs.existsSync(backupDir)) {
+  if (!fs.existsSync(backupDir)) {
     console.log('El directorio de backups no existe:', backupDir);
     return [];
   }
 
   const files = getAllBackups(backupDir)
     .sort()
-    .reverse(); // Más recientes primero
+    .reverse();
 
   return files;
 }
@@ -57,7 +57,6 @@ async function selectBackup() {
   backups.forEach((file, index) => {
     const stats = fs.statSync(file);
     const size = (stats.size / 1024).toFixed(2);
-    const fileName = path.basename(file);
     const relPath = path.relative(process.env.BACKUP_DIR || './backups', file);
     console.log(`${index + 1}. ${relPath} (${size} KB) - ${stats.mtime.toLocaleString('es-MX')}`);
   });
@@ -77,6 +76,39 @@ async function selectBackup() {
   }
 
   return backups[index];
+}
+
+function restoreObjectIds(obj) {
+  if (obj === null || obj === undefined) {
+    return obj;
+  }
+
+  if (Array.isArray(obj)) {
+    return obj.map(item => restoreObjectIds(item));
+  }
+
+  if (typeof obj === 'object') {
+    if (obj.$oid) {
+      return new ObjectId(obj.$oid);
+    }
+
+    const newObj = {};
+    for (const [key, value] of Object.entries(obj)) {
+      if ((key === '_id' || key.endsWith('Id') || key === 'userId') && 
+          typeof value === 'string' && value.length === 24) {
+        try {
+          newObj[key] = new ObjectId(value);
+        } catch (e) {
+          newObj[key] = value;
+        }
+      } else {
+        newObj[key] = restoreObjectIds(value);
+      }
+    }
+    return newObj;
+  }
+
+  return obj;
 }
 
 async function restoreBackup(backupPath) {
@@ -121,7 +153,11 @@ async function restoreBackup(backupPath) {
       
       // Insertar nuevos datos
       if (collectionData.count > 0) {
-        await collection.insertMany(collectionData.documents);
+        // Restaurar ObjectIds correctamente
+        const documentsToInsert = restoreObjectIds(collectionData.documents);
+        
+        // Verificar que los _id se están restaurando correctamente
+        await collection.insertMany(documentsToInsert, { ordered: false });
         console.log(`   ${collectionData.count} documentos restaurados`);
       } else {
         console.log(`   Colección vacía, no hay documentos para restaurar`);
