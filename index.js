@@ -2,42 +2,29 @@ require('dotenv').config();
 
 const fs = require('fs');
 const path = require('path');
-const crypto = require('crypto');
 const { MongoClient } = require('mongodb');
+const archiver = require('archiver');
+const { exec } = require('child_process');
+const { promisify } = require('util');
+
+const execPromise = promisify(exec);
 
 // Configuración desde variables de entorno
 const MONGO_URI = process.env.MONGO_URI
 const DB_NAME = process.env.DB_NAME
 const BACKUP_DIR = process.env.BACKUP_DIR
 const DAYS_TO_KEEP = parseInt(process.env.DAYS_TO_KEEP, 10)
+const RCLONE_REMOTE = process.env.RCLONE_REMOTE
+const ENABLE_SYNC = process.env.ENABLE_SYNC === 'true'
 
 // Crear directorio de backups si no existe
 if (!fs.existsSync(BACKUP_DIR)) {
     fs.mkdirSync(BACKUP_DIR, { recursive: true });
 }
 
-function generateBackupPath() {
-    const now = new Date();
-    const year = now.getFullYear();
-    const month = String(now.getMonth() + 1).padStart(2, '0');
-    const day = String(now.getDate()).padStart(2, '0');
-    const hours = String(now.getHours()).padStart(2, '0');
-    const minutes = String(now.getMinutes()).padStart(2, '0');
-    const seconds = String(now.getSeconds()).padStart(2, '0');
-    const hash = crypto.randomBytes(4).toString('hex');
-
-    const dateDir = path.join(BACKUP_DIR, year.toString(), month, day);
-    
-    if (!fs.existsSync(dateDir)) {
-        fs.mkdirSync(dateDir, { recursive: true });
-    }
-
-    const fileName = `${hours}_${minutes}_${seconds}_${hash}.json`;
-    return path.join(dateDir, fileName);
-}
-
 async function createBackup() {
-    const backupPath = generateBackupPath();
+    const timestamp = new Date().toISOString().replace(/[:.]/g, '-');
+    const backupPath = path.join(BACKUP_DIR, `backup-${timestamp}.json`);
 
     const client = new MongoClient(MONGO_URI);
 
@@ -56,7 +43,7 @@ async function createBackup() {
 
         for (const collInfo of collections) {
             const collName = collInfo.name;
-            console.log(`Respaldando coleccion: ${collName}`);
+            console.log(`Respaldando colección: ${collName}`);
 
             const collection = db.collection(collName);
             const documents = await collection.find({}).toArray();
@@ -80,42 +67,48 @@ async function createBackup() {
     }
 }
 
+async function compressBackup(backupPath) {
+    const zipPath = `${backupPath.replace('.json', '')}.zip`;
+
+    return new Promise((resolve, reject) => {
+        const output = fs.createWriteStream(zipPath);
+        const archive = archiver('zip', { zlib: { level: 9 } });
+
+        output.on('close', () => {
+            const sizeInMB = (archive.pointer() / (1024 * 1024)).toFixed(2);
+            console.log(`Backup comprimido: ${path.basename(zipPath)} (${sizeInMB} MB)`);
+            fs.unlinkSync(backupPath);
+            resolve(zipPath);
+        });
+
+        archive.on('error', (err) => reject(err));
+
+        archive.pipe(output);
+        archive.file(backupPath, { name: path.basename(backupPath) });
+        archive.finalize();
+    });
+}
+
 function cleanOldBackups(daysToKeep = 30) {
     try {
+        const files = fs.readdirSync(BACKUP_DIR);
         const cutoffDate = new Date();
         cutoffDate.setDate(cutoffDate.getDate() - daysToKeep);
 
         let deletedCount = 0;
 
-        // Función recursiva para buscar y eliminar archivos antiguos
-        function processDirectory(dir) {
-            if (!fs.existsSync(dir)) return;
-            
-            const entries = fs.readdirSync(dir, { withFileTypes: true });
-            
-            for (const entry of entries) {
-                const fullPath = path.join(dir, entry.name);
+        files.forEach(file => {
+            if (file.startsWith('backup-') && file.endsWith('.zip')) {
+                const filePath = path.join(BACKUP_DIR, file);
+                const stats = fs.statSync(filePath);
                 
-                if (entry.isDirectory()) {
-                    processDirectory(fullPath);
-                    // Eliminar directorio si está vacío
-                    const remaining = fs.readdirSync(fullPath);
-                    if (remaining.length === 0) {
-                        fs.rmdirSync(fullPath);
-                        console.log(`Directorio vacío eliminado: ${fullPath}`);
-                    }
-                } else if (entry.name.endsWith('.json')) {
-                    const stats = fs.statSync(fullPath);
-                    if (stats.mtime < cutoffDate) {
-                        fs.unlinkSync(fullPath);
-                        console.log(`Eliminado: ${fullPath}`);
-                        deletedCount++;
-                    }
+                if (stats.mtime < cutoffDate) {
+                    fs.unlinkSync(filePath);
+                    console.log(`Eliminado: ${file}`);
+                    deletedCount++;
                 }
             }
-        }
-
-        processDirectory(BACKUP_DIR);
+        });
 
         if (deletedCount === 0) {
             console.log('No hay backups antiguos para eliminar');
@@ -127,35 +120,44 @@ function cleanOldBackups(daysToKeep = 30) {
     }
 }
 
+async function syncToDrive() {
+    if (!ENABLE_SYNC) {
+        console.log('Sincronización con Drive deshabilitada');
+        return;
+    }
+
+    try {
+        console.log('\nSincronizando con Google Drive...');
+        
+        const command = `rclone sync "${BACKUP_DIR}" "${RCLONE_REMOTE}" --transfers 4 --checkers 8`;
+        const { stdout, stderr } = await execPromise(command);
+        
+        if (stderr) {
+            console.log('Advertencias:', stderr);
+        }
+        
+        console.log('Sincronización completada');
+    } catch (error) {
+        console.error('Error al sincronizar con Drive:', error.message);
+        throw error;
+    }
+}
+
 function getBackupStats() {
     try {
+        const files = fs.readdirSync(BACKUP_DIR);
+        const backupFiles = files.filter(f => f.startsWith('backup-') && f.endsWith('.zip'));
+        
         let totalSize = 0;
-        let fileCount = 0;
-
-        function countFiles(dir) {
-            if (!fs.existsSync(dir)) return;
-            
-            const entries = fs.readdirSync(dir, { withFileTypes: true });
-            
-            for (const entry of entries) {
-                const fullPath = path.join(dir, entry.name);
-                
-                if (entry.isDirectory()) {
-                    countFiles(fullPath);
-                } else if (entry.name.endsWith('.json')) {
-                    const stats = fs.statSync(fullPath);
-                    totalSize += stats.size;
-                    fileCount++;
-                }
-            }
-        }
-
-        countFiles(BACKUP_DIR);
+        backupFiles.forEach(file => {
+            const stats = fs.statSync(path.join(BACKUP_DIR, file));
+            totalSize += stats.size;
+        });
 
         const totalSizeMB = (totalSize / (1024 * 1024)).toFixed(2);
-
-        console.log('\nEstadisticas de backups:');
-        console.log(`   Total de backups: ${fileCount}`);
+        
+        console.log('\nEstadísticas de backups:');
+        console.log(`   Total de backups: ${backupFiles.length}`);
         console.log(`   Espacio utilizado: ${totalSizeMB} MB`);
         console.log(`   Ubicación: ${path.resolve(BACKUP_DIR)}`);
     } catch (error) {
@@ -168,13 +170,19 @@ async function main() {
         console.log('Iniciando proceso de backup...');
         console.log(`Base de datos: ${DB_NAME}`);
         console.log(`Directorio: ${BACKUP_DIR}`);
-        console.log(`Retencion: ${DAYS_TO_KEEP} dias\n`);
+        console.log(`Retención: ${DAYS_TO_KEEP} días`);
+        console.log(`Sync a Drive: ${ENABLE_SYNC ? 'Habilitado' : 'Deshabilitado'}\n`);
 
-        await createBackup();
-
+        const backupPath = await createBackup();
+        const zipPath = await compressBackup(backupPath);
+        
         console.log('\nLimpiando backups antiguos...');
         cleanOldBackups(DAYS_TO_KEEP);
-
+        
+        if (ENABLE_SYNC) {
+            await syncToDrive();
+        }
+        
         getBackupStats();
 
         console.log('\nProceso completado exitosamente');
